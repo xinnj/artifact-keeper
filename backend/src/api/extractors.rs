@@ -167,6 +167,26 @@ pub fn trusted_external_url() -> Option<&'static str> {
     configured_external_url()
 }
 
+/// Frontend base path (sub-path prefix) for SSO callback redirects.
+///
+/// When the frontend is deployed under a sub-path (e.g. `/ak`), the backend's
+/// post-OIDC/SAML callback redirect to `/callback?code=...` must include the
+/// prefix (`/ak/callback?code=...`) so the browser lands on the correct
+/// Next.js route. Set `FRONTEND_BASE_PATH` to the sub-path (e.g. `/ak`).
+/// When unset, redirects are root-relative (the historical default).
+///
+/// Read once from `FRONTEND_BASE_PATH` env var and cached for the process lifetime.
+pub fn frontend_base_path() -> &'static str {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        std::env::var("FRONTEND_BASE_PATH")
+            .ok()
+            .map(|p| p.trim().trim_end_matches('/').to_string())
+            .filter(|p| !p.is_empty())
+            .unwrap_or_default()
+    })
+}
+
 /// External base URL derived from request metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestBaseUrl(pub String);

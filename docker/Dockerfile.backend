@@ -1,6 +1,18 @@
 # ---------- Base: Rust toolchain on UBI 9 ----------
 # syntax=docker/dockerfile:1
 FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rust-base
+ARG DNF_MIRROR=""
+ARG GH_PROXY=""
+ARG RUSTUP_DIST_SERVER=""
+ARG RUSTUP_UPDATE_ROOT=""
+ARG CARGO_REGISTRY_MIRROR=""
+RUN if [ -n "$DNF_MIRROR" ]; then \
+      appstream_url=$(printf '%s' "$DNF_MIRROR" | sed 's|/BaseOS/|/AppStream/|'); \
+      printf '[ubi-9-baseos-rpms]\nname=UBI 9 BaseOS (mirror)\nbaseurl=%s\ngpgcheck=0\nenabled=1\n' \
+        "$DNF_MIRROR" > /etc/yum.repos.d/ubi.repo; \
+      printf '\n[ubi-9-appstream-rpms]\nname=UBI 9 AppStream (mirror)\nbaseurl=%s\ngpgcheck=0\nenabled=1\n' \
+        "$appstream_url" >> /etc/yum.repos.d/ubi.repo; \
+    fi
 RUN dnf install -y --nodocs \
     gcc gcc-c++ make pkg-config perl-core \
     openssl-devel zlib-devel xz-devel bzip2-devel \
@@ -12,11 +24,22 @@ RUN dnf install -y --nodocs \
       aarch64) PROTOC_ARCH="linux-aarch_64" ;; \
       *)       echo "Unsupported architecture: $ARCH" && exit 1 ;; \
     esac && \
-    curl --proto '=https' --tlsv1.2 -sSfL "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-${PROTOC_ARCH}.zip" \
+    PROTOC_URL="https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-${PROTOC_ARCH}.zip"; \
+    [ -n "$GH_PROXY" ] && PROTOC_URL="${GH_PROXY}/github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-${PROTOC_ARCH}.zip"; \
+    curl --proto '=https' --tlsv1.2 -sSfL "$PROTOC_URL" \
       -o /tmp/protoc.zip && \
     unzip -q /tmp/protoc.zip -d /usr/local && rm /tmp/protoc.zip && \
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.93.0 && \
+    if [ -n "$RUSTUP_DIST_SERVER" ]; then \
+      export RUSTUP_DIST_SERVER="$RUSTUP_DIST_SERVER"; \
+      export RUSTUP_UPDATE_ROOT="${RUSTUP_UPDATE_ROOT:-$RUSTUP_DIST_SERVER/rustup}"; \
+    fi && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && \
     . "$HOME/.cargo/env" && \
+    if [ -n "$CARGO_REGISTRY_MIRROR" ]; then \
+      mkdir -p "$HOME/.cargo" && \
+      printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "sparse+%s"\n' \
+        "$CARGO_REGISTRY_MIRROR" > "$HOME/.cargo/config.toml"; \
+    fi && \
     cargo install cargo-chef --locked
 ENV PATH="/root/.cargo/bin:${PATH}"
 
@@ -50,9 +73,13 @@ COPY backend ./backend
 ARG GIT_SHA=unknown
 ARG CARGO_FEATURES=""
 ARG APP_VERSION=""
+ARG GH_PROXY=""
 ENV SQLX_OFFLINE=true
 ENV GIT_SHA=${GIT_SHA}
-RUN if [ -n "${APP_VERSION}" ]; then \
+RUN if [ -n "${GH_PROXY}" ]; then \
+      export SWAGGER_UI_DOWNLOAD_URL="${GH_PROXY}/github.com/swagger-api/swagger-ui/archive/refs/tags/v5.17.14.zip"; \
+    fi && \
+    if [ -n "${APP_VERSION}" ]; then \
       CLEAN_VERSION=$(echo "${APP_VERSION}" | sed 's/^v//'); \
       sed -i "s/^version = \".*\"/version = \"${CLEAN_VERSION}\"/" Cargo.toml; \
     fi && \
@@ -64,6 +91,15 @@ RUN if [ -n "${APP_VERSION}" ]; then \
 
 # ---------- Stage 4: Build minimal rootfs ----------
 FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rootfs-builder
+
+ARG DNF_MIRROR=""
+RUN if [ -n "$DNF_MIRROR" ]; then \
+      appstream_url=$(printf '%s' "$DNF_MIRROR" | sed 's|/BaseOS/|/AppStream/|'); \
+      printf '[ubi-9-baseos-rpms]\nname=UBI 9 BaseOS (mirror)\nbaseurl=%s\ngpgcheck=0\nenabled=1\n' \
+        "$DNF_MIRROR" > /etc/yum.repos.d/ubi.repo; \
+      printf '\n[ubi-9-appstream-rpms]\nname=UBI 9 AppStream (mirror)\nbaseurl=%s\ngpgcheck=0\nenabled=1\n' \
+        "$appstream_url" >> /etc/yum.repos.d/ubi.repo; \
+    fi
 
 # Install only essential runtime libraries into a clean rootfs.
 # --refresh forces fresh repo metadata and the follow-up `upgrade -y` pulls

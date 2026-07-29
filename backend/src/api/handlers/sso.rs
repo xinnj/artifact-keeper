@@ -1155,7 +1155,12 @@ pub struct SsoApiDoc;
 /// route group does not add a URL prefix). The exchange code is URL-encoded
 /// and passed as a query parameter so the frontend can exchange it for tokens.
 pub(crate) fn build_frontend_callback_url(exchange_code: &str) -> String {
-    format!("/callback?code={}", urlencoding::encode(exchange_code))
+    let base = crate::api::extractors::frontend_base_path();
+    format!(
+        "{}/callback?code={}",
+        base,
+        urlencoding::encode(exchange_code)
+    )
 }
 
 /// Build a 307 redirect to the frontend `/callback` page that also carries
