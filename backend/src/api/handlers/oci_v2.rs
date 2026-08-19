@@ -2366,6 +2366,10 @@ fn oci_repo_info_from_member(
 /// using the full original image_name as the upstream image path. Without
 /// this, only `/v2/<repo-key>/<image>/...` works and dockerd's mirror
 /// config is silently bypassed.
+///
+/// The same variable also drives the PUSH fallback: a push to an unknown
+/// repo key resolves to this repo. When that repo is Virtual, the push is
+/// routed to its first Local/Staging member (see [`resolve_push_repo`]).
 fn default_docker_mirror_repo() -> Option<&'static str> {
     static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     CACHE
@@ -2461,6 +2465,32 @@ async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Resp
         is_public: repo.try_get("is_public").map_err(map_db_err)?,
         image: effective_image,
     })
+}
+
+/// Resolve the repository that will accept an OCI push for `image_name`.
+///
+/// Wraps [`resolve_repo`] and, when that yields a Virtual repository, re-resolves
+/// the write target to the first Local/Staging member (by `virtual_repo_members`
+/// priority). Virtual repos are read-only aggregates, so a push is attributed to
+/// a concrete hosted member rather than rejected. A virtual repo with no writable
+/// member is rejected with 405 UNSUPPORTED. Remote repos are left untouched here
+/// and continue to be rejected by `stores_own_manifests` in the push handlers.
+async fn resolve_push_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Response> {
+    let repo = resolve_repo(db, image_name).await?;
+    if repo.repo_type != RepositoryType::Virtual {
+        return Ok(repo);
+    }
+
+    let members = proxy_helpers::fetch_virtual_members(db, repo.id).await?;
+    if let Some(member) = members.into_iter().find(|m| m.repo_type.is_hosted()) {
+        return Ok(oci_repo_info_from_member(&member, &repo.image));
+    }
+
+    Err(oci_error(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "UNSUPPORTED",
+        "no writable (local/staging) member in virtual repository",
+    ))
 }
 
 /// Check whether an upstream URL points to Docker Hub.
@@ -4763,7 +4793,7 @@ async fn handle_start_upload(
         return oci_forbidden_scope("write:artifacts");
     }
 
-    let repo = match resolve_repo(&state.db, image_name).await {
+    let repo = match resolve_push_repo(&state.db, image_name).await {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -5115,7 +5145,7 @@ async fn handle_patch_upload(
     // session created against repo A cannot be driven via repo B's URL
     // (issue #1317). Same 404 shape for "no session" and "session in another
     // repo" avoids leaking session existence across repos.
-    let repo = match resolve_repo(&state.db, image_name).await {
+    let repo = match resolve_push_repo(&state.db, image_name).await {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -5360,7 +5390,7 @@ async fn handle_cancel_upload(
         }
     };
 
-    let repo = match resolve_repo(&state.db, image_name).await {
+    let repo = match resolve_push_repo(&state.db, image_name).await {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -5601,7 +5631,7 @@ async fn handle_complete_upload(
     // Resolve repo from URL first, then bind it into the session lookup so a
     // session created against repo A cannot be completed via repo B's URL
     // (issue #1317).
-    let repo = match resolve_repo(&state.db, image_name).await {
+    let repo = match resolve_push_repo(&state.db, image_name).await {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -7967,7 +7997,7 @@ async fn handle_put_manifest(
         return oci_forbidden_scope("write:artifacts");
     }
 
-    let repo = match resolve_repo(&state.db, image_name).await {
+    let repo = match resolve_push_repo(&state.db, image_name).await {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -9000,7 +9030,7 @@ async fn handle_delete_manifest(
         return oci_forbidden_scope("delete:artifacts");
     }
 
-    let repo = match resolve_repo(&state.db, image_name).await {
+    let repo = match resolve_push_repo(&state.db, image_name).await {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -23095,6 +23125,119 @@ mod cross_repo_session_regression_tests {
             .execute(&pool)
             .await;
         cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+    }
+
+    /// Link a member repo into a virtual repo with the given priority.
+    async fn link_virtual_member(pool: &PgPool, virtual_id: Uuid, member_id: Uuid, priority: i32) {
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(virtual_id)
+        .bind(member_id)
+        .bind(priority)
+        .execute(pool)
+        .await
+        .expect("link virtual member");
+    }
+
+    /// A push resolving a virtual repo must route to its first Local/Staging
+    /// member, so the write lands in a hosted repo rather than being rejected.
+    #[tokio::test]
+    async fn resolve_push_repo_routes_virtual_to_local_member() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (virtual_id, virtual_key, virtual_dir) =
+            create_typed_oci_repo(&pool, "virtual", "route").await;
+        let (member_id, _member_key, member_dir) = create_docker_repo(&pool, "route-member").await;
+        link_virtual_member(&pool, virtual_id, member_id, 1).await;
+
+        let info = resolve_push_repo(&pool, &format!("{}/myimage", virtual_key))
+            .await
+            .expect("virtual push must resolve");
+        assert_eq!(info.id, member_id, "push must route to the Local member");
+        assert_eq!(info.repo_type, "local", "resolved repo type must be local");
+        assert_eq!(info.image, "myimage", "image name must be preserved");
+
+        cleanup_all(
+            &pool,
+            &[virtual_id, member_id],
+            Uuid::nil(),
+            &[virtual_dir, member_dir],
+        )
+        .await;
+    }
+
+    /// A virtual repo with no Local/Staging member must not accept a push.
+    #[tokio::test]
+    async fn resolve_push_repo_rejects_virtual_without_hosted_member() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        // No members at all.
+        let (virtual_id, virtual_key, virtual_dir) =
+            create_typed_oci_repo(&pool, "virtual", "nomember").await;
+        assert!(
+            resolve_push_repo(&pool, &format!("{}/myimage", virtual_key))
+                .await
+                .is_err(),
+            "a virtual repo with no members must not resolve a push target"
+        );
+        cleanup_all(&pool, &[virtual_id], Uuid::nil(), &[virtual_dir]).await;
+
+        // Remote-only member is not writable.
+        let (virtual_id, virtual_key, virtual_dir) =
+            create_typed_oci_repo(&pool, "virtual", "remmember").await;
+        let (remote_id, _remote_key, remote_dir) =
+            create_typed_oci_repo(&pool, "remote", "remote-member").await;
+        link_virtual_member(&pool, virtual_id, remote_id, 1).await;
+        assert!(
+            resolve_push_repo(&pool, &format!("{}/myimage", virtual_key))
+                .await
+                .is_err(),
+            "a virtual repo whose only member is Remote must not resolve a push target"
+        );
+        cleanup_all(
+            &pool,
+            &[virtual_id, remote_id],
+            Uuid::nil(),
+            &[virtual_dir, remote_dir],
+        )
+        .await;
+    }
+
+    /// Non-virtual repos must resolve unchanged: a Local repo is written to
+    /// directly and a Remote repo is left for `stores_own_manifests` to reject.
+    #[tokio::test]
+    async fn resolve_push_repo_leaves_non_virtual_unchanged() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (local_id, local_key, local_dir) = create_docker_repo(&pool, "pushlocal").await;
+        let info = resolve_push_repo(&pool, &format!("{}/myimage", local_key))
+            .await
+            .expect("local push must resolve");
+        assert_eq!(info.id, local_id);
+        assert_eq!(info.repo_type, "local");
+
+        let (remote_id, remote_key, remote_dir) =
+            create_typed_oci_repo(&pool, "remote", "pushremote").await;
+        let info = resolve_push_repo(&pool, &format!("{}/myimage", remote_key))
+            .await
+            .expect("remote push must resolve (rejected later by stores_own_manifests)");
+        assert_eq!(info.id, remote_id);
+        assert_eq!(info.repo_type, "remote");
+
+        cleanup_all(
+            &pool,
+            &[local_id, remote_id],
+            Uuid::nil(),
+            &[local_dir, remote_dir],
+        )
+        .await;
     }
 
     /// #1776: anonymous GET /v2/{name}/tags/list on a PUBLIC repo must succeed
