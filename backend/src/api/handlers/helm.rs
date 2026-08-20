@@ -903,6 +903,19 @@ async fn soft_delete_chart_version(
     name: &str,
     version: &str,
 ) -> Result<(), Response> {
+    // Pre-fetch the distinct checksums (a signed chart owns .tgz + .tgz.prov,
+    // each with its own digest) so the catalog can be pruned after the delete.
+    let checksums: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT checksum_sha256 FROM artifacts \
+         WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false",
+    )
+    .bind(repo_id)
+    .bind(name)
+    .bind(version)
+    .fetch_all(db)
+    .await
+    .map_err(super::db_err)?;
+
     sqlx::query(
         "UPDATE artifacts SET is_deleted = true, updated_at = NOW() \
          WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false",
@@ -913,6 +926,13 @@ async fn soft_delete_chart_version(
     .execute(db)
     .await
     .map_err(super::db_err)?;
+
+    // Best-effort: prune the package catalog for each removed digest.
+    for checksum in checksums {
+        let _ = crate::services::package_service::PackageService::new(db.clone())
+            .prune_on_delete(repo_id, &checksum)
+            .await;
+    }
     Ok(())
 }
 
@@ -978,7 +998,7 @@ async fn delete_chart(
     // just as easily have matched the .prov and left the chart behind.
     let rows = sqlx::query(
         r#"
-        SELECT id, path
+        SELECT id, path, checksum_sha256
         FROM artifacts
         WHERE repository_id = $1
           AND name = $2
@@ -1002,6 +1022,7 @@ async fn delete_chart(
     }
 
     let artifact_ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.get("id")).collect();
+    let checksums: Vec<String> = rows.iter().map(|r| r.get("checksum_sha256")).collect();
     let prov_count = rows
         .iter()
         .filter(|r| is_prov_filename(&r.get::<String, _>("path")))
@@ -1015,6 +1036,13 @@ async fn delete_chart(
         .execute(&state.db)
         .await
         .map_err(crate::api::handlers::db_err)?;
+
+    // Best-effort: prune the package catalog for each removed digest.
+    for checksum in checksums {
+        let _ = crate::services::package_service::PackageService::new(state.db.clone())
+            .prune_on_delete(repo.id, &checksum)
+            .await;
+    }
 
     // Update repository timestamp
     let _ = sqlx::query!(
@@ -1981,8 +2009,7 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         let (status, _) = upload_parts(&f, &[("chart", "mychart-1.0.0.tgz", &chart_a)]).await;
         assert_eq!(status, StatusCode::CREATED);
 
-        let (status, _) =
-            upload_parts_force(&f, &[("chart", "mychart-1.0.0.tgz", &chart_b)]).await;
+        let (status, _) = upload_parts_force(&f, &[("chart", "mychart-1.0.0.tgz", &chart_b)]).await;
         assert_eq!(status, StatusCode::CREATED);
 
         let app = f.router_anon(super::router());
@@ -2041,18 +2068,14 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         assert_eq!(status, StatusCode::CREATED);
 
         // Force re-upload the chart WITHOUT provenance.
-        let (status, _) =
-            upload_parts_force(&f, &[("chart", "provchart-0.1.0.tgz", &tgz)]).await;
+        let (status, _) = upload_parts_force(&f, &[("chart", "provchart-0.1.0.tgz", &tgz)]).await;
         assert_eq!(status, StatusCode::CREATED);
 
         // The stale provenance must now 404, not serve for the new chart.
         let app = f.router_anon(super::router());
         let (status, _) = tdh::send(
             app,
-            tdh::get(format!(
-                "/{}/charts/provchart-0.1.0.tgz.prov",
-                f.repo_key
-            )),
+            tdh::get(format!("/{}/charts/provchart-0.1.0.tgz.prov", f.repo_key)),
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);

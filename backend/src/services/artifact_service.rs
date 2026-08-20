@@ -1987,6 +1987,13 @@ impl ArtifactService {
             return Err(AppError::NotFound("Artifact not found".to_string()));
         }
 
+        // Best-effort: prune the package catalog so the deleted artifact doesn't
+        // leave a ghost entry on the Packages page. A failure here must not fail
+        // the already-committed soft-delete.
+        let _ = crate::services::package_service::PackageService::new(self.db.clone())
+            .prune_on_delete(artifact.repository_id, &artifact.checksum_sha256)
+            .await;
+
         // A delete supersedes any upload retries for the same artifact.
         let _ = sqlx::query(CANCEL_SUPERSEDED_PUSH_TASKS_SQL)
             .bind(id)

@@ -664,6 +664,13 @@ impl LifecycleService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // Best-effort: reconcile the package catalog so lifecycle soft-deletes
+        // don't leave ghost entries on the Packages page. A failure here must
+        // not fail the policy execution.
+        let _ = crate::services::package_service::PackageService::new(self.db.clone())
+            .reconcile_catalog(CascadeScope::from(policy.repository_id).repo_filter())
+            .await;
+
         // Bookkeeping: single-row update, no transaction needed.
         sqlx::query(
             "UPDATE lifecycle_policies SET last_run_at = NOW(), last_run_items_removed = $2 WHERE id = $1",

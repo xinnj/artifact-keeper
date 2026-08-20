@@ -196,6 +196,148 @@ impl PackageService {
             );
         }
     }
+
+    /// Prune the `packages`/`package_versions` catalog rows backed solely by the
+    /// soft-deleted artifact whose content digest is `checksum_sha256`. Called
+    /// after a soft-delete so the Packages page stops showing a ghost entry (the
+    /// catalog is otherwise write-only).
+    ///
+    /// Matching is by checksum only — `package_versions.checksum_sha256` is
+    /// always written from `artifacts.checksum_sha256` — so this works across
+    /// every format without recomputing the format-specific package name. The
+    /// `NOT EXISTS` guard keeps the row when another live artifact still carries
+    /// the same digest (e.g. identical content published under two names).
+    pub async fn prune_on_delete(
+        &self,
+        repository_id: Uuid,
+        checksum_sha256: &str,
+    ) -> Result<(), sqlx::Error> {
+        // 1. Drop the version row(s) for this digest, but only when no live
+        // artifact still backs that content in this repo.
+        sqlx::query(
+            r#"
+            DELETE FROM package_versions pv
+            USING packages p
+            WHERE pv.package_id = p.id
+              AND p.repository_id = $1
+              AND pv.checksum_sha256 = $2
+              AND NOT EXISTS (
+                SELECT 1 FROM artifacts a
+                WHERE a.repository_id = $1
+                  AND a.checksum_sha256 = $2
+                  AND a.is_deleted = false
+              )
+            "#,
+        )
+        .bind(repository_id)
+        .bind(checksum_sha256)
+        .execute(&self.db)
+        .await?;
+
+        // 2. Drop now-empty packages (no remaining versions).
+        sqlx::query(
+            r#"
+            DELETE FROM packages p
+            WHERE p.repository_id = $1
+              AND NOT EXISTS (
+                SELECT 1 FROM package_versions pv WHERE pv.package_id = p.id
+              )
+            "#,
+        )
+        .bind(repository_id)
+        .execute(&self.db)
+        .await?;
+
+        // 3. Refresh the denormalized packages.version when the deleted version
+        // was the one being advertised (best-effort, deterministic MAX).
+        sqlx::query(
+            r#"
+            UPDATE packages p
+            SET version = (
+                  SELECT pv.version FROM package_versions pv
+                  WHERE pv.package_id = p.id
+                  ORDER BY pv.version DESC
+                  LIMIT 1
+                ),
+                updated_at = NOW()
+            WHERE p.repository_id = $1
+              AND NOT EXISTS (
+                SELECT 1 FROM package_versions pv
+                WHERE pv.package_id = p.id AND pv.version = p.version
+              )
+            "#,
+        )
+        .bind(repository_id)
+        .execute(&self.db)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Bulk counterpart of [`prune_on_delete`]: reconcile the catalog against
+    /// live artifacts across a whole repository (or all repositories when
+    /// `repository_id` is `None`). Called after lifecycle bulk soft-deletes so
+    /// auto-expired artifacts don't leave ghost packages on the Packages page.
+    pub async fn reconcile_catalog(&self, repository_id: Option<Uuid>) -> Result<(), sqlx::Error> {
+        // 1. Drop package_versions whose content digest has no live artifact in
+        // the same repository.
+        sqlx::query(
+            r#"
+            DELETE FROM package_versions pv
+            USING packages p
+            WHERE pv.package_id = p.id
+              AND ($1::UUID IS NULL OR p.repository_id = $1)
+              AND NOT EXISTS (
+                SELECT 1 FROM artifacts a
+                WHERE a.repository_id = p.repository_id
+                  AND a.checksum_sha256 = pv.checksum_sha256
+                  AND a.is_deleted = false
+              )
+            "#,
+        )
+        .bind(repository_id)
+        .execute(&self.db)
+        .await?;
+
+        // 2. Drop now-empty packages.
+        sqlx::query(
+            r#"
+            DELETE FROM packages p
+            WHERE ($1::UUID IS NULL OR p.repository_id = $1)
+              AND NOT EXISTS (
+                SELECT 1 FROM package_versions pv WHERE pv.package_id = p.id
+              )
+            "#,
+        )
+        .bind(repository_id)
+        .execute(&self.db)
+        .await?;
+
+        // 3. Refresh the denormalized packages.version when the advertised
+        // version no longer exists.
+        sqlx::query(
+            r#"
+            UPDATE packages p
+            SET version = (
+                  SELECT pv.version FROM package_versions pv
+                  WHERE pv.package_id = p.id
+                  ORDER BY pv.version DESC
+                  LIMIT 1
+                ),
+                updated_at = NOW()
+            WHERE ($1::UUID IS NULL OR p.repository_id = $1)
+              AND NOT EXISTS (
+                SELECT 1 FROM package_versions pv
+                WHERE pv.package_id = p.id AND pv.version = p.version
+              )
+            "#,
+        )
+        .bind(repository_id)
+        .execute(&self.db)
+        .await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -486,5 +628,110 @@ mod tests {
         );
         assert!(log_msg.contains("my-crate@1.2.3"));
         assert!(log_msg.contains(&repository_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn prune_on_delete_removes_orphaned_catalog() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let service = PackageService::new(fx.pool.clone());
+        let package = "prune-package";
+        let version = "1.0.0";
+        let checksum = "e".repeat(64);
+
+        service
+            .create_or_update_from_artifact(
+                fx.repo_id, package, version, 100, &checksum, None, None,
+            )
+            .await
+            .expect("seed catalog");
+
+        service
+            .prune_on_delete(fx.repo_id, &checksum)
+            .await
+            .expect("prune catalog");
+
+        let packages: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM packages WHERE repository_id = $1 AND name = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(package)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(packages, 0, "orphaned package row must be pruned");
+
+        let versions: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM package_versions pv \
+             JOIN packages p ON p.id = pv.package_id \
+             WHERE p.repository_id = $1 AND p.name = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(package)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(versions, 0, "orphaned package_versions row must be pruned");
+
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn prune_on_delete_keeps_catalog_when_a_live_artifact_shares_the_checksum() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let service = PackageService::new(fx.pool.clone());
+        let package = "shared-checksum-package";
+        let version = "1.0.0";
+        let checksum = "f".repeat(64);
+
+        service
+            .create_or_update_from_artifact(
+                fx.repo_id, package, version, 100, &checksum, None, None,
+            )
+            .await
+            .expect("seed catalog");
+
+        // A still-live artifact carries the same content digest, so the prune's
+        // NOT EXISTS guard must keep the catalog row.
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, content_type, storage_key) \
+             VALUES ($1, 'shared/1.0.0/a.bin', $2, $3, 100, $4, 'application/octet-stream', 'storage/shared')",
+        )
+        .bind(fx.repo_id)
+        .bind(package)
+        .bind(version)
+        .bind(&checksum)
+        .execute(&fx.pool)
+        .await
+        .expect("seed live artifact");
+
+        service
+            .prune_on_delete(fx.repo_id, &checksum)
+            .await
+            .expect("prune catalog");
+
+        let packages: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM packages WHERE repository_id = $1 AND name = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(package)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            packages, 1,
+            "catalog row must be kept while a live artifact shares the digest"
+        );
+
+        fx.teardown().await;
     }
 }

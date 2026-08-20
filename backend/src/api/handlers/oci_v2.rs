@@ -9148,6 +9148,14 @@ async fn handle_delete_manifest(
     .execute(&state.db)
     .await;
 
+    // Best-effort: prune the package catalog so the deleted manifest doesn't
+    // leave a ghost entry on the Packages page. `digest` is "sha256:<hex>"; the
+    // catalog stores the bare hex, so strip the prefix before matching.
+    let checksum = digest.strip_prefix("sha256:").unwrap_or(digest.as_str());
+    let _ = crate::services::package_service::PackageService::new(state.db.clone())
+        .prune_on_delete(repo.id, checksum)
+        .await;
+
     info!(
         "Manifest deleted: {}:{} (digest {})",
         image_name, reference, digest

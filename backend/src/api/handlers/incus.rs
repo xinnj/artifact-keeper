@@ -1167,6 +1167,17 @@ async fn delete_image(
 
     let artifact_path = build_artifact_path(&product, &version, &filename);
 
+    // Pre-fetch the checksum so the package catalog can be pruned after the
+    // soft-delete (the catalog is keyed by the content digest).
+    let checksum: Option<String> = sqlx::query_scalar(
+        "SELECT checksum_sha256 FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false LIMIT 1",
+    )
+    .bind(repo.id)
+    .bind(&artifact_path)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(db_err)?;
+
     let result = sqlx::query(
         r#"
         UPDATE artifacts SET is_deleted = true, updated_at = NOW()
@@ -1181,6 +1192,14 @@ async fn delete_image(
 
     if result.rows_affected() == 0 {
         return Err((StatusCode::NOT_FOUND, "Image file not found").into_response());
+    }
+
+    // Best-effort: prune the package catalog so the deleted image doesn't leave
+    // a ghost entry on the Packages page.
+    if let Some(checksum) = checksum {
+        let _ = crate::services::package_service::PackageService::new(state.db.clone())
+            .prune_on_delete(repo.id, &checksum)
+            .await;
     }
 
     Ok(Response::builder()
