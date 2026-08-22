@@ -6091,9 +6091,29 @@ async fn list_artifacts_grouped_by_docker_tag(
         i64::from(page - 1) * i64::from(per_page)
     };
 
+    // A virtual repository owns no `oci_tags`/`artifacts` rows of its own —
+    // pushes to it route to a hosted member, so the tag grouping must expand
+    // to the member repositories exactly like the flat listing and the Maven
+    // component grouping. Members are returned in priority order, which the
+    // de-duplicating subquery in `fetch_docker_tag_rows` uses via
+    // `array_position` to shadow lower-priority members on a duplicate
+    // `(image, tag)`.
+    let repo_ids: Vec<Uuid> = if repo.repo_type == RepositoryType::Virtual {
+        proxy_helpers::fetch_virtual_members(&state.db, repo.id)
+            .await
+            .map_err(|_| {
+                AppError::Internal("Failed to resolve virtual repository members".to_string())
+            })?
+            .iter()
+            .map(|m| m.id)
+            .collect()
+    } else {
+        vec![repo.id]
+    };
+
     let mut rows = fetch_docker_tag_rows(
         &state.db,
-        repo.id,
+        &repo_ids,
         search_query,
         keyset.as_ref(),
         offset,
@@ -6120,7 +6140,7 @@ async fn list_artifacts_grouped_by_docker_tag(
     let child_sizes = if index_digests.is_empty() {
         std::collections::HashMap::new()
     } else {
-        fetch_index_child_sizes(&state.db, repo.id, &index_digests).await?
+        fetch_index_child_sizes(&state.db, &repo_ids, &index_digests).await?
     };
 
     // Rows arrive in (image, tag) order straight from the keyset index; no
@@ -6131,7 +6151,7 @@ async fn list_artifacts_grouped_by_docker_tag(
         .collect();
 
     let exact_total = if count_exact {
-        Some(count_docker_tag_rows(&state.db, repo.id, search_query).await?)
+        Some(count_docker_tag_rows(&state.db, &repo_ids, search_query).await?)
     } else {
         None
     };
@@ -6212,26 +6232,44 @@ pub(crate) fn rollup_scan_status(statuses: &[String]) -> Option<String> {
     Some("partial".to_string())
 }
 
-/// Shared FROM/JOIN + base WHERE for the docker-tag grouped listing, used by
-/// both the page and the COUNT queries so exact totals agree with walkable
-/// page contents (#2520).
+/// Shared FROM/JOIN for the docker-tag grouped listing, used by both the page
+/// and the COUNT queries so exact totals agree with walkable page contents
+/// (#2520).
 ///
-/// POSITION(':' IN tag) = 0 excludes digest references (sha256:...),
+/// `POSITION(':' IN tag) = 0` excludes digest references (sha256:...),
 /// matching the spec'd /v2/<name>/tags/list filter.
 ///
-/// The artifacts join is by composed path because OCI artifact rows do
-/// not carry a back-reference to the oci_tags row; the push handler
-/// composes `v2/{image}/manifests/{tag}` deterministically. We use
+/// The `oci_tags` side is de-duplicated by `(name, tag)` across the queried
+/// repository ids so a virtual repository that aggregates members (hosted +
+/// remote) surfaces each tag once — the higher-priority member shadows lower
+/// ones, matching the flat listing's `DISTINCT ON (path)` contract. The
+/// artifacts join is by composed path because OCI artifact rows do not carry
+/// a back-reference to the oci_tags row; the push handler composes
+/// `v2/{image}/manifests/{tag}` deterministically. We use
 /// `repository_id + path` so the join survives image renames.
-const DOCKER_TAG_ROWS_FROM_SQL: &str = r#"FROM oci_tags t
-            JOIN artifacts a
-              ON a.repository_id = t.repository_id
-             AND a.path = 'v2/' || t.name || '/manifests/' || t.tag
-             AND a.is_deleted = false"#;
+const DOCKER_TAG_ROWS_FROM_SQL: &str = r#"FROM (
+            SELECT DISTINCT ON (t.name, t.tag)
+                t.repository_id,
+                t.name,
+                t.tag,
+                t.manifest_digest,
+                t.manifest_content_type,
+                t.updated_at
+            FROM oci_tags t
+            WHERE t.repository_id = ANY($1)
+              AND POSITION(':' IN t.tag) = 0
+            ORDER BY t.name, t.tag, array_position($1::uuid[], t.repository_id)
+        ) t
+        JOIN artifacts a
+          ON a.repository_id = t.repository_id
+         AND a.path = 'v2/' || t.name || '/manifests/' || t.tag
+         AND a.is_deleted = false"#;
 
-/// Base WHERE companion to [`DOCKER_TAG_ROWS_FROM_SQL`].
-const DOCKER_TAG_ROWS_WHERE_SQL: &str = r#"WHERE t.repository_id = $1
-              AND POSITION(':' IN t.tag) = 0"#;
+/// Base WHERE companion to [`DOCKER_TAG_ROWS_FROM_SQL`]. The repository and
+/// tag-shape filters now live inside the de-duplicating subquery, so this is a
+/// bare `WHERE` anchor for the search/keyset predicates the callers append
+/// with `AND`. `$1` is bound exactly once, inside the subquery.
+const DOCKER_TAG_ROWS_WHERE_SQL: &str = "WHERE true";
 
 /// Fetch raw rows from `oci_tags` joined to `artifacts` and (optionally) the
 /// latest `scan_results` rows. Returns at most `limit` rows, ordered by
@@ -6254,7 +6292,7 @@ const DOCKER_TAG_ROWS_WHERE_SQL: &str = r#"WHERE t.repository_id = $1
 /// precedence in its doc comment.
 async fn fetch_docker_tag_rows(
     db: &sqlx::PgPool,
-    repository_id: Uuid,
+    repository_ids: &[Uuid],
     search_query: Option<&str>,
     keyset: Option<&(String, String)>,
     offset: i64,
@@ -6306,7 +6344,7 @@ async fn fetch_docker_tag_rows(
         next_param + 1
     ));
 
-    let mut query = sqlx::query(&sql).bind(repository_id);
+    let mut query = sqlx::query(&sql).bind(repository_ids);
     if let Some(q) = search_query {
         query = query.bind(q);
     }
@@ -6363,14 +6401,14 @@ async fn fetch_docker_tag_rows(
 /// always matches what a full cursor walk returns.
 async fn count_docker_tag_rows(
     db: &sqlx::PgPool,
-    repository_id: Uuid,
+    repository_ids: &[Uuid],
     search_query: Option<&str>,
 ) -> Result<i64> {
     let mut sql = format!("SELECT COUNT(*) {DOCKER_TAG_ROWS_FROM_SQL} {DOCKER_TAG_ROWS_WHERE_SQL}");
     if search_query.is_some() {
         sql.push_str(" AND LOWER(t.tag) LIKE '%' || LOWER($2) || '%'");
     }
-    let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(repository_id);
+    let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(repository_ids);
     if let Some(q) = search_query {
         query = query.bind(q);
     }
@@ -6391,7 +6429,7 @@ async fn count_docker_tag_rows(
 /// `download_blob` fallback behavior for missing children.
 async fn fetch_index_child_sizes(
     db: &sqlx::PgPool,
-    repository_id: Uuid,
+    repository_ids: &[Uuid],
     index_digests: &[String],
 ) -> Result<std::collections::HashMap<String, i64>> {
     use sqlx::Row;
@@ -6405,11 +6443,11 @@ async fn fetch_index_child_sizes(
               ON a.repository_id = r.repository_id
              AND a.checksum_sha256 = REPLACE(r.child_digest, 'sha256:', '')
              AND a.is_deleted = false
-            WHERE r.repository_id = $1
+            WHERE r.repository_id = ANY($1)
               AND r.parent_digest = ANY($2)
             GROUP BY r.parent_digest"#,
     )
-    .bind(repository_id)
+    .bind(repository_ids)
     .bind(index_digests)
     .fetch_all(db)
     .await
