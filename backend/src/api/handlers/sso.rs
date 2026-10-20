@@ -383,7 +383,15 @@ pub(crate) fn is_interaction_required_error(error: &str) -> bool {
 /// with a `silent_denied` marker and deliberately NO error payload. The web
 /// UI treats it as "remain anonymous" (records the attempt and returns the
 /// user to where they were); it must never render an error for it.
-pub(crate) const SILENT_DENIED_CALLBACK_URL: &str = "/callback?silent_denied=1";
+pub(crate) fn silent_denied_callback_url_with_base(base: &str) -> String {
+    format!("{base}/callback?silent_denied=1")
+}
+
+/// [`silent_denied_callback_url_with_base`] using the configured frontend
+/// base path, so a sub-path deployment keeps the prefix on this redirect too.
+pub(crate) fn build_silent_denied_callback_url() -> String {
+    silent_denied_callback_url_with_base(crate::api::extractors::frontend_base_path())
+}
 
 /// Classification of an OIDC authorization callback (RFC 6749 4.1.2 / 4.1.2.1).
 #[derive(Debug, PartialEq, Eq)]
@@ -506,7 +514,7 @@ async fn finish_silent_denied(state: &SharedState, sso_state: Option<&str>) -> R
         // lookup exists purely to burn the single-use session row.
         let _ = AuthConfigService::validate_sso_session(&state.db, s).await;
     }
-    Redirect::temporary(SILENT_DENIED_CALLBACK_URL).into_response()
+    Redirect::temporary(&build_silent_denied_callback_url()).into_response()
 }
 
 /// Handle OIDC authorization callback
@@ -1412,8 +1420,18 @@ pub struct SsoApiDoc;
 /// The Next.js frontend serves the callback page at `/callback` (the `(auth)`
 /// route group does not add a URL prefix). The exchange code is URL-encoded
 /// and passed as a query parameter so the frontend can exchange it for tokens.
+pub(crate) fn frontend_callback_url_with_base(base: &str, exchange_code: &str) -> String {
+    format!(
+        "{}/callback?code={}",
+        base,
+        urlencoding::encode(exchange_code)
+    )
+}
+
+/// [`frontend_callback_url_with_base`] using the configured frontend base
+/// path.
 pub(crate) fn build_frontend_callback_url(exchange_code: &str) -> String {
-    format!("/callback?code={}", urlencoding::encode(exchange_code))
+    frontend_callback_url_with_base(crate::api::extractors::frontend_base_path(), exchange_code)
 }
 
 /// Build a 307 redirect to the frontend `/callback` page that also carries
@@ -3043,13 +3061,19 @@ mod tests {
     }
 
     #[test]
-    fn test_silent_denied_redirect_carries_no_error_payload() {
+    fn test_silent_denied_callback_url_carries_marker_and_no_error_payload() {
         // The frontend contract: a marker, not an error. If this URL ever
         // grows an `error` parameter the callback page will render an error
         // card for every anonymous visitor with no IdP session.
-        assert!(SILENT_DENIED_CALLBACK_URL.starts_with("/callback?"));
-        assert!(SILENT_DENIED_CALLBACK_URL.contains("silent_denied=1"));
-        assert!(!SILENT_DENIED_CALLBACK_URL.contains("error"));
+        for (base, expected) in [
+            ("", "/callback?silent_denied=1"),
+            ("/ak", "/ak/callback?silent_denied=1"),
+        ] {
+            let url = silent_denied_callback_url_with_base(base);
+            assert_eq!(url, expected);
+            assert!(url.contains("silent_denied=1"));
+            assert!(!url.contains("error"));
+        }
     }
 
     #[test]
@@ -3131,35 +3155,47 @@ mod tests {
 
     #[test]
     fn test_frontend_callback_url_simple_code() {
-        let url = build_frontend_callback_url("abc123");
+        let url = frontend_callback_url_with_base("", "abc123");
         assert_eq!(url, "/callback?code=abc123");
     }
 
     #[test]
     fn test_frontend_callback_url_does_not_use_auth_prefix() {
-        let url = build_frontend_callback_url("test");
+        let url = frontend_callback_url_with_base("", "test");
         assert!(url.starts_with("/callback?"));
         assert!(!url.contains("/auth/callback"));
     }
 
     #[test]
     fn test_frontend_callback_url_encodes_special_chars() {
-        let url = build_frontend_callback_url("code with spaces&symbols=yes");
+        let url = frontend_callback_url_with_base("", "code with spaces&symbols=yes");
         assert_eq!(url, "/callback?code=code%20with%20spaces%26symbols%3Dyes");
     }
 
     #[test]
     fn test_frontend_callback_url_empty_code() {
-        let url = build_frontend_callback_url("");
+        let url = frontend_callback_url_with_base("", "");
         assert_eq!(url, "/callback?code=");
     }
 
     #[test]
     fn test_frontend_callback_url_unicode_code() {
-        let url = build_frontend_callback_url("token-\u{00e9}\u{00e8}");
+        let url = frontend_callback_url_with_base("", "token-\u{00e9}\u{00e8}");
         // urlencoding will percent-encode the non-ASCII bytes
         assert!(url.starts_with("/callback?code="));
         assert!(!url.contains('\u{00e9}'));
+    }
+
+    #[test]
+    fn test_frontend_callback_url_with_sub_path_base() {
+        assert_eq!(
+            frontend_callback_url_with_base("/ak", "abc123"),
+            "/ak/callback?code=abc123"
+        );
+        assert_eq!(
+            frontend_callback_url_with_base("/deploy/ak", "code with spaces&symbols=yes"),
+            "/deploy/ak/callback?code=code%20with%20spaces%26symbols%3Dyes"
+        );
     }
 
     // -----------------------------------------------------------------------
