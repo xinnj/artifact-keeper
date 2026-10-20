@@ -41,6 +41,20 @@ pub fn ensure_sso_encryption_key() {
     }
 }
 
+/// Pin the process-global frontend base path for this test process.
+///
+/// `extractors::frontend_base_path()` caches `FRONTEND_BASE_PATH` in a
+/// `OnceLock` on first use, so this MUST run before any SSO callback handler.
+/// Under `cargo nextest` every test is its own process, making the write
+/// deterministic and isolated. Under plain `cargo test` all tests in the
+/// binary share one process: run an env-sensitive test by exact name instead.
+pub fn set_frontend_base_path(base: Option<&str>) {
+    match base {
+        Some(base) => std::env::set_var("FRONTEND_BASE_PATH", base),
+        None => std::env::remove_var("FRONTEND_BASE_PATH"),
+    }
+}
+
 /// Connect to the throwaway Postgres named by `DATABASE_URL`, or return `None`
 /// so the caller can skip cleanly (matching the repo `--ignored` convention).
 pub async fn try_pool() -> Option<PgPool> {

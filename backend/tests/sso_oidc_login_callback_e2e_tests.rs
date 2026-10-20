@@ -78,7 +78,8 @@ use artifact_keeper_backend::services::auth_config_service::{
 
 use common::sso_support::{
     allow_private_sso_ip, audit_row_eventually, build_state, build_state_with_config,
-    ensure_sso_encryption_key, non_loopback_bind_ip, sso_app, test_config, try_pool,
+    ensure_sso_encryption_key, non_loopback_bind_ip, set_frontend_base_path, sso_app, test_config,
+    try_pool,
 };
 
 // ===========================================================================
@@ -437,6 +438,26 @@ async fn do_callback(
     .expect("callback oneshot")
 }
 
+/// Drive the callback with extra request headers (used to prove that spoofed
+/// proxy headers cannot influence the frontend redirect target).
+async fn do_callback_with_headers(
+    state: SharedState,
+    provider_id: Uuid,
+    query: &str,
+    headers: &[(&str, &str)],
+) -> axum::response::Response {
+    let app = sso_app(state);
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri(format!("/oidc/{provider_id}/callback?{query}"));
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    app.oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .expect("callback oneshot")
+}
+
 /// Convenience: callback with `code=mock-auth-code&state=<state>`.
 async fn do_callback_state(
     pool: &PgPool,
@@ -520,6 +541,7 @@ async fn test_oidc_login_redirects_with_correct_params() {
 #[tokio::test]
 #[ignore = "requires DATABASE_URL + non-loopback IP"]
 async fn test_oidc_login_callback_full_roundtrip() {
+    set_frontend_base_path(None);
     let Some(pool) = try_pool().await else {
         return;
     };
@@ -570,6 +592,125 @@ async fn test_oidc_login_callback_full_roundtrip() {
     let (_, username, email) = user.expect("callback must provision the federated user");
     assert_eq!(username, "e2e-user");
     assert_eq!(email.as_deref(), Some("e2e-user@example.test"));
+
+    delete_user_by_sub(&pool, &external_id).await;
+    delete_provider(&pool, provider_id).await;
+}
+
+/// `FRONTEND_BASE_PATH` must prefix the post-callback frontend redirect.
+///
+/// Env-sensitive: `frontend_base_path()` caches the value in a `OnceLock`, so
+/// this test must run in its own process (nextest) and set the variable before
+/// any SSO handler runs.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL + non-loopback IP; env-sensitive, run under nextest"]
+async fn test_oidc_callback_redirect_uses_frontend_base_path() {
+    set_frontend_base_path(Some("/ak"));
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let Some(idp) = MockIdp::start().await else {
+        return;
+    };
+    let provider_id = create_provider(&pool, &idp).await;
+    let (sso_state, nonce) = login_state_nonce(&pool, provider_id).await;
+
+    let external_id = format!("oidc-sub-basepath-{}", Uuid::new_v4().as_simple());
+    idp.mount_token_endpoint(
+        &nonce,
+        json!({
+            "sub": external_id,
+            "preferred_username": "e2e-base-user",
+            "email": "e2e-base-user@example.test",
+            "name": "E2E Base User",
+        }),
+    )
+    .await;
+
+    let resp = do_callback_state(&pool, provider_id, &sso_state).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::TEMPORARY_REDIRECT,
+        "successful callback must 307 to the frontend"
+    );
+    let location = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        location.starts_with("/ak/callback?code="),
+        "callback must keep the FRONTEND_BASE_PATH prefix, got {location}"
+    );
+    assert!(
+        !location.starts_with("/callback?"),
+        "the base path was dropped from the redirect: {location}"
+    );
+    assert!(
+        resp.headers().get_all("set-cookie").iter().count() > 0,
+        "callback redirect must set auth cookies"
+    );
+
+    delete_user_by_sub(&pool, &external_id).await;
+    delete_provider(&pool, provider_id).await;
+}
+
+/// The frontend redirect target is operator configuration, never request
+/// metadata: spoofed `Host` / `X-Forwarded-*` headers must not influence it.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL + non-loopback IP; env-sensitive, run under nextest"]
+async fn test_oidc_callback_redirect_ignores_spoofed_host_headers() {
+    set_frontend_base_path(Some("/ak"));
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let Some(idp) = MockIdp::start().await else {
+        return;
+    };
+    let provider_id = create_provider(&pool, &idp).await;
+    let (sso_state, nonce) = login_state_nonce(&pool, provider_id).await;
+
+    let external_id = format!("oidc-sub-spoof-{}", Uuid::new_v4().as_simple());
+    idp.mount_token_endpoint(
+        &nonce,
+        json!({
+            "sub": external_id,
+            "preferred_username": "e2e-spoof-user",
+            "email": "e2e-spoof-user@example.test",
+            "name": "E2E Spoof User",
+        }),
+    )
+    .await;
+
+    let resp = do_callback_with_headers(
+        build_state(pool.clone()),
+        provider_id,
+        &format!(
+            "code=mock-auth-code&state={}",
+            urlencoding::encode(&sso_state)
+        ),
+        &[
+            ("host", "evil.example.test"),
+            ("x-forwarded-host", "evil.example.test"),
+            ("x-forwarded-proto", "https"),
+        ],
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    let location = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        location.starts_with("/ak/callback?code="),
+        "spoofed headers must not change the frontend redirect, got {location}"
+    );
+    assert!(
+        !location.contains("evil.example.test"),
+        "request Host headers leaked into the redirect: {location}"
+    );
 
     delete_user_by_sub(&pool, &external_id).await;
     delete_provider(&pool, provider_id).await;
@@ -1181,6 +1322,46 @@ async fn test_oidc_login_prompt_other_values_rejected() {
     delete_provider(&pool, provider_id).await;
 }
 
+/// The silent-denied redirect must honour `FRONTEND_BASE_PATH` too; otherwise a
+/// sub-path deployment sends anonymous visitors to a route it does not serve.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL + non-loopback IP; env-sensitive, run under nextest"]
+async fn test_oidc_callback_login_required_redirects_silent_denied_under_base_path() {
+    set_frontend_base_path(Some("/ak"));
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let Some(idp) = MockIdp::start().await else {
+        return;
+    };
+    let provider_id = create_provider(&pool, &idp).await;
+    let (sso_state, _nonce) = login_state_nonce(&pool, provider_id).await;
+
+    let resp = do_callback(
+        build_state(pool.clone()),
+        provider_id,
+        &format!(
+            "error=login_required&error_description=Authentication%20required&state={}",
+            urlencoding::encode(&sso_state)
+        ),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    let location = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert_eq!(
+        location, "/ak/callback?silent_denied=1",
+        "silent denial must keep the configured base path"
+    );
+    assert!(!location.contains("error"));
+
+    delete_provider(&pool, provider_id).await;
+}
+
 /// The "no live IdP session" answer to a silent probe (`error=login_required`)
 /// must produce a clean 307 to `/callback?silent_denied=1` — no error status,
 /// no error payload — and must consume the one-time SSO session so the state
@@ -1188,6 +1369,7 @@ async fn test_oidc_login_prompt_other_values_rejected() {
 #[tokio::test]
 #[ignore = "requires DATABASE_URL + non-loopback IP"]
 async fn test_oidc_callback_login_required_redirects_silent_denied() {
+    set_frontend_base_path(None);
     let Some(pool) = try_pool().await else {
         return;
     };
@@ -1240,6 +1422,7 @@ async fn test_oidc_callback_login_required_redirects_silent_denied() {
 #[tokio::test]
 #[ignore = "requires DATABASE_URL + non-loopback IP"]
 async fn test_oidc_generic_callback_login_required_redirects_silent_denied() {
+    set_frontend_base_path(None);
     let Some(pool) = try_pool().await else {
         return;
     };

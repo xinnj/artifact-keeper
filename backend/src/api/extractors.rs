@@ -229,6 +229,47 @@ pub fn trusted_external_url() -> Option<&'static str> {
     configured_external_url()
 }
 
+/// Frontend base path (sub-path prefix) for SSO callback redirects.
+///
+/// When the frontend is deployed under a sub-path (e.g. `/ak`), the backend's
+/// post-OIDC/SAML callback redirect to `/callback?code=...` must include the
+/// prefix (`/ak/callback?code=...`) so the browser lands on the correct
+/// Next.js route. Set `FRONTEND_BASE_PATH` to the sub-path (e.g. `/ak`).
+/// When unset, redirects are root-relative (the historical default).
+///
+/// Read once from `FRONTEND_BASE_PATH` env var and cached for the process lifetime.
+pub fn frontend_base_path() -> &'static str {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        normalize_frontend_base_path(&std::env::var("FRONTEND_BASE_PATH").unwrap_or_default())
+    })
+}
+
+/// Normalize an operator-supplied frontend base path.
+///
+/// `FRONTEND_BASE_PATH` is a path prefix, not a URL. Normalization is strict so
+/// the result can be concatenated with `/callback` safely:
+/// - surrounding whitespace is trimmed;
+/// - empty path segments are dropped;
+/// - exactly one leading `/` is added to a non-empty result.
+///
+/// `ak`, `/ak`, `/ak/`, `  /ak  ` and `//ak` all become `/ak`. The `//` case
+/// matters: `//ak/callback?...` in a `Location` header is a scheme-relative URL
+/// and browsers would navigate to host `ak`.
+pub fn normalize_frontend_base_path(raw: &str) -> String {
+    let path = raw
+        .trim()
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+    if path.is_empty() {
+        String::new()
+    } else {
+        format!("/{path}")
+    }
+}
+
 /// External base URL derived from request metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestBaseUrl(pub String);
@@ -495,6 +536,31 @@ mod tests {
             request_base_url_from_host_header(&headers),
             "https://registry.example.com"
         );
+    }
+
+    #[test]
+    fn test_normalize_frontend_base_path() {
+        let cases = [
+            ("", ""),
+            ("/", ""),
+            ("///", ""),
+            ("  /  ", ""),
+            ("/ak", "/ak"),
+            ("/ak/", "/ak"),
+            ("  /ak  ", "/ak"),
+            ("ak", "/ak"),
+            ("//ak", "/ak"),
+            ("/a//b/", "/a/b"),
+            ("/deploy/ak/", "/deploy/ak"),
+        ];
+        for (raw, expected) in cases {
+            let actual = normalize_frontend_base_path(raw);
+            assert_eq!(actual, expected, "normalize({raw:?})");
+            assert!(
+                actual.is_empty() || (actual.starts_with('/') && !actual.starts_with("//")),
+                "normalize({raw:?}) = {actual:?} must be empty or host-relative"
+            );
+        }
     }
 
     #[test]

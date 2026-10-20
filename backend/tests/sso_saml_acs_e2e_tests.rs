@@ -75,8 +75,8 @@ use artifact_keeper_backend::services::auth_config_service::{
 
 use common::sso_support::{
     audit_row_eventually, base64_standard, build_state, ensure_sso_encryption_key,
-    saml_idp_cert_pem, sign_saml_document, sign_saml_document_with_key, sso_app, try_pool,
-    SamlResponseSpec,
+    saml_idp_cert_pem, set_frontend_base_path, sign_saml_document, sign_saml_document_with_key,
+    sso_app, try_pool, SamlResponseSpec,
 };
 
 // ===========================================================================
@@ -238,6 +238,7 @@ fn happy_spec(request_id: &str, name_id: &str) -> SamlResponseSpec {
 #[tokio::test]
 #[ignore = "requires DATABASE_URL"]
 async fn test_saml_acs_happy_path() {
+    set_frontend_base_path(None);
     let Some(pool) = try_pool().await else {
         return;
     };
@@ -277,6 +278,52 @@ async fn test_saml_acs_happy_path() {
         email.as_deref(),
         Some(format!("{name_id}@saml-e2e.test").as_str()),
         "email must come from the `email` attribute"
+    );
+
+    delete_saml_user(&pool, &name_id).await;
+    delete_saml_provider(&pool, provider_id).await;
+}
+
+/// The SAML ACS redirect must honour `FRONTEND_BASE_PATH` exactly like OIDC:
+/// both call sites share `build_frontend_callback_url`.
+///
+/// Env-sensitive: run it under nextest so the `OnceLock` is fresh.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL; env-sensitive, run under nextest"]
+async fn test_saml_acs_happy_path_uses_frontend_base_path() {
+    set_frontend_base_path(Some("/ak"));
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let provider_id = create_saml_provider(&pool, SamlProviderOpts::default()).await;
+
+    let name_id = format!("saml-basepath-{}", Uuid::new_v4().as_simple());
+    let request_id = seed_session(&pool, provider_id).await;
+    let spec = happy_spec(&request_id, &name_id);
+
+    let resp = post_acs(build_state(pool.clone()), provider_id, &spec.signed_b64()).await;
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::TEMPORARY_REDIRECT,
+        "a valid signed assertion must 307 to the frontend"
+    );
+    let location = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        location.starts_with("/ak/callback?code="),
+        "SAML ACS must keep the FRONTEND_BASE_PATH prefix, got {location}"
+    );
+    assert!(
+        !location.starts_with("/callback?"),
+        "the base path was dropped from the ACS redirect: {location}"
+    );
+    assert!(
+        resp.headers().get_all("set-cookie").iter().count() > 0,
+        "the ACS redirect must set auth cookies (#1405)"
     );
 
     delete_saml_user(&pool, &name_id).await;
