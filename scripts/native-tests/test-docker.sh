@@ -13,6 +13,7 @@ _ak_test_env="$(dirname "$0")/../lib/test-env.sh"
 [ -r "$_ak_test_env" ] && . "$_ak_test_env"
 REGISTRY_PASS="${REGISTRY_PASS:-${AK_TEST_ADMIN_PASSWORD:-}}"
 REPO_KEY="${REPO_KEY:-test-docker}"
+VIRTUAL_REPO_KEY="${VIRTUAL_REPO_KEY:-docker-virtual}"
 # STORAGE_BACKEND (optional, #1529): the storage backend the server under test
 # is configured with (`filesystem`, `s3`, ...). When set, the suite asserts
 # that REPO_KEY really is stored on it, so a run meant to cover S3 cannot
@@ -23,6 +24,8 @@ STORAGE_BACKEND="${STORAGE_BACKEND:-}"
 # streamed multipart write rather than a single PUT.
 LARGE_LAYER_MIB="${LARGE_LAYER_MIB:-12}"
 TEST_VERSION="1.0.$(date +%s)"
+VIRTUAL_IMAGE="$REGISTRY_URL/$VIRTUAL_REPO_KEY/e2e-test:$TEST_VERSION"
+VIRTUAL_IMAGE_ALT="$REGISTRY_URL/$VIRTUAL_REPO_KEY/e2e-test:$TEST_VERSION-alt"
 FAILURES=0
 REGISTRY_SCHEME="${REGISTRY_SCHEME:-http}"
 REGISTRY_BASE_URL="${REGISTRY_SCHEME}://$REGISTRY_URL"
@@ -136,7 +139,7 @@ fi
 echo ""
 echo "--- Test: docker push ---"
 WORK_DIR="$(mktemp -d)"
-trap 'rm -rf "$WORK_DIR"; docker rmi "$IMAGE_NAME" 2>/dev/null || true' EXIT
+trap 'rm -rf "$WORK_DIR"; docker rmi "$IMAGE_NAME" "$VIRTUAL_IMAGE" "$VIRTUAL_IMAGE_ALT" 2>/dev/null || true' EXIT
 
 cat > "$WORK_DIR/Dockerfile" << EOF
 FROM alpine:3.19
@@ -456,6 +459,140 @@ if [ "$GOT_DIGEST" = "$CHUNKED_DIGEST" ]; then
     pass "Chunked blob reads back byte-identical ($((SIZE_A + SIZE_B)) bytes)"
 else
     fail "Chunked blob read back as $GOT_DIGEST, expected $CHUNKED_DIGEST"
+fi
+
+# --------------------------------------------------------------------------
+# 15. Virtual repository push routing
+# --------------------------------------------------------------------------
+# A push addressed to a Virtual repo must be routed to its highest-priority
+# hosted (Local/Staging) member, and the member must serve the result. The
+# virtual repo is created here rather than in e2e-setup.sh because the
+# standalone oci-storage-e2e stack never runs the compose `setup` service.
+echo ""
+echo "--- Test: Virtual repository $VIRTUAL_REPO_KEY ---"
+VKEY_CODE=$(curl -s -o /dev/null -w "$HTTP_CODE_FORMAT" -u "$REGISTRY_USER:$REGISTRY_PASS" \
+    "$REGISTRY_BASE_URL/api/v1/repositories/$VIRTUAL_REPO_KEY" || true)
+if [ "$VKEY_CODE" = "404" ]; then
+    VCREATE_CODE=$(curl -s -o /dev/null -w "$HTTP_CODE_FORMAT" -u "$REGISTRY_USER:$REGISTRY_PASS" \
+        -X POST "$REGISTRY_BASE_URL/api/v1/repositories" -H 'Content-Type: application/json' \
+        -d "{\"key\":\"$VIRTUAL_REPO_KEY\",\"name\":\"Virtual Docker E2E\",\"format\":\"docker\",\"repo_type\":\"virtual\",\"is_public\":false,\"member_repos\":[{\"repo_key\":\"$REPO_KEY\",\"priority\":1}]}" || true)
+    if [ "$VCREATE_CODE" = "200" ] || [ "$VCREATE_CODE" = "201" ]; then
+        pass "Created virtual repository $VIRTUAL_REPO_KEY (member $REPO_KEY, priority 1)"
+    else
+        fail "Creating virtual repository $VIRTUAL_REPO_KEY returned $VCREATE_CODE"
+    fi
+fi
+# Idempotent reconciliation; 409 means the member is already linked. This also
+# repairs a pre-existing virtual repo created without members.
+VMEMBER_CODE=$(curl -s -o /dev/null -w "$HTTP_CODE_FORMAT" -u "$REGISTRY_USER:$REGISTRY_PASS" \
+    -X POST "$REGISTRY_BASE_URL/api/v1/repositories/$VIRTUAL_REPO_KEY/members" \
+    -H 'Content-Type: application/json' \
+    -d "{\"member_key\":\"$REPO_KEY\",\"priority\":1}" || true)
+if [ "$VMEMBER_CODE" = "200" ] || [ "$VMEMBER_CODE" = "201" ] || [ "$VMEMBER_CODE" = "409" ]; then
+    pass "Virtual member $REPO_KEY linked to $VIRTUAL_REPO_KEY"
+else
+    fail "Linking $REPO_KEY to $VIRTUAL_REPO_KEY returned $VMEMBER_CODE"
+fi
+
+# Push the image built above through the virtual URL.
+docker tag "$IMAGE_NAME" "$VIRTUAL_IMAGE" 2>/dev/null || true
+if docker push "$VIRTUAL_IMAGE" 2>&1; then
+    pass "docker push through the virtual repository succeeded"
+else
+    fail "docker push through the virtual repository failed"
+fi
+
+TOKEN=$(curl -s -u "$REGISTRY_USER:$REGISTRY_PASS" "$REGISTRY_BASE_URL/v2/token" \
+    | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+
+VHDRS="$WORK_DIR/virtual-manifest-headers"
+V_MANIFEST_CODE=$(curl -s -o /dev/null -D "$VHDRS" -w "$HTTP_CODE_FORMAT" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+    "$REGISTRY_BASE_URL/v2/$VIRTUAL_REPO_KEY/e2e-test/manifests/$TEST_VERSION")
+V_DIGEST=$(grep -i '^docker-content-digest:' "$VHDRS" | tail -1 | cut -d' ' -f2- | tr -d '\r' || true)
+M_MANIFEST_CODE=$(curl -s -o /dev/null -D "$VHDRS" -w "$HTTP_CODE_FORMAT" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+    "$REGISTRY_BASE_URL/v2/$REPO_KEY/e2e-test/manifests/$TEST_VERSION")
+M_DIGEST=$(grep -i '^docker-content-digest:' "$VHDRS" | tail -1 | cut -d' ' -f2- | tr -d '\r' || true)
+
+if [ "$V_MANIFEST_CODE" = "200" ]; then
+    pass "Manifest retrievable through the virtual URL"
+else
+    fail "Manifest GET via virtual URL returned $V_MANIFEST_CODE, expected 200"
+fi
+if [ "$M_MANIFEST_CODE" = "200" ]; then
+    pass "Manifest landed in member $REPO_KEY"
+else
+    fail "Manifest GET via member URL returned $M_MANIFEST_CODE, expected 200"
+fi
+if [ -n "$V_DIGEST" ] && [ "$V_DIGEST" = "$M_DIGEST" ]; then
+    pass "Virtual and member manifest digests match ($V_DIGEST)"
+else
+    fail "Manifest digest mismatch: virtual='$V_DIGEST' member='$M_DIGEST'"
+fi
+
+# Second tag through the virtual URL, visible through both tag lists.
+docker tag "$VIRTUAL_IMAGE" "$VIRTUAL_IMAGE_ALT" 2>/dev/null || true
+if docker push "$VIRTUAL_IMAGE_ALT" 2>&1; then
+    pass "Second tag push through the virtual repository succeeded"
+else
+    fail "Second tag push through the virtual repository failed"
+fi
+VTAGS=$(curl -s -H "Authorization: Bearer $TOKEN" \
+    "$REGISTRY_BASE_URL/v2/$VIRTUAL_REPO_KEY/e2e-test/tags/list")
+MTAGS=$(curl -s -H "Authorization: Bearer $TOKEN" \
+    "$REGISTRY_BASE_URL/v2/$REPO_KEY/e2e-test/tags/list")
+if echo "$VTAGS" | grep -q "$TEST_VERSION-alt"; then
+    pass "Virtual tag list contains $TEST_VERSION-alt"
+else
+    fail "Virtual tag list missing $TEST_VERSION-alt: $VTAGS"
+fi
+if echo "$MTAGS" | grep -q "$TEST_VERSION-alt"; then
+    pass "Second tag landed in member $REPO_KEY"
+else
+    fail "Second tag missing from member tag list: $MTAGS"
+fi
+
+# Upload-session status through the virtual URL. The session is keyed to the
+# routed member, so the status probe must resolve the same way (204, not 404).
+VUHDRS="$WORK_DIR/virtual-upload-headers"
+V_START_CODE=$(curl -s -o /dev/null -D "$VUHDRS" -w "$HTTP_CODE_FORMAT" -X POST \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Length: 0" \
+    "$REGISTRY_BASE_URL/v2/$VIRTUAL_REPO_KEY/e2e-status/blobs/uploads/")
+if [ "$V_START_CODE" = "202" ]; then
+    pass "Upload session started through the virtual URL"
+else
+    fail "Upload start via virtual URL returned $V_START_CODE, expected 202"
+fi
+V_UUID=$(grep -i '^docker-upload-uuid:' "$VUHDRS" | tail -1 | cut -d' ' -f2- | tr -d '\r' || true)
+V_LOCATION=$(grep -i '^location:' "$VUHDRS" | tail -1 | cut -d' ' -f2- | tr -d '\r' || true)
+case "$V_LOCATION" in
+/v2/$VIRTUAL_REPO_KEY/*) pass "Upload Location keeps the virtual URL" ;;
+*) fail "Upload Location did not use the virtual key: $V_LOCATION" ;;
+esac
+V_STATUS_CODE=$(curl -s -o /dev/null -D "$VUHDRS" -w "$HTTP_CODE_FORMAT" \
+    -H "Authorization: Bearer $TOKEN" \
+    "$REGISTRY_BASE_URL/v2/$VIRTUAL_REPO_KEY/e2e-status/blobs/uploads/$V_UUID")
+if [ "$V_STATUS_CODE" = "204" ]; then
+    pass "Upload-status GET through the virtual URL returns 204"
+else
+    fail "Upload-status GET via virtual URL returned $V_STATUS_CODE, expected 204"
+fi
+V_RANGE=$(grep -i '^range:' "$VUHDRS" | tail -1 | cut -d' ' -f2- | tr -d '\r' || true)
+if [ "$V_RANGE" = "0-0" ]; then
+    pass "Upload-status Range reports 0-0"
+else
+    fail "Upload-status Range was '$V_RANGE', expected 0-0"
+fi
+V_CANCEL_CODE=$(curl -s -o /dev/null -w "$HTTP_CODE_FORMAT" -X DELETE \
+    -H "Authorization: Bearer $TOKEN" \
+    "$REGISTRY_BASE_URL/v2/$VIRTUAL_REPO_KEY/e2e-status/blobs/uploads/$V_UUID")
+if [ "$V_CANCEL_CODE" = "204" ]; then
+    pass "Upload session cancelled through the virtual URL"
+else
+    fail "Upload cancel via virtual URL returned $V_CANCEL_CODE, expected 204"
 fi
 
 # --------------------------------------------------------------------------
