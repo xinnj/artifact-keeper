@@ -6041,6 +6041,13 @@ mod tests {
             .expect("backend crate has a parent directory (repo root)");
 
         let workflows = discover_workflow_files(repo_root);
+        // The fork's sub-path branch keeps only release-backend-fork.yml; the
+        // upstream publishing workflows this pin guards are intentionally
+        // absent there. Keep the assertion for every other layout so an
+        // accidental upstream deletion still fails.
+        if workflows.len() == 1 && workflows.iter().any(|f| f == "release-backend-fork.yml") {
+            return;
+        }
         assert!(
             workflows.iter().any(|f| f == "docker-publish.yml"),
             "expected to discover docker-publish.yml among the repo's \

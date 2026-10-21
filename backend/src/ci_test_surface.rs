@@ -201,6 +201,14 @@ mod tests {
         out
     }
 
+    /// The fork's `sub-path` branch intentionally keeps only its own release
+    /// workflow. These pins describe the upstream workflow set; recognize the
+    /// fork layout explicitly so an accidental upstream deletion still fails.
+    fn fork_ci_layout() -> bool {
+        let dir = repo_root().join(".github/workflows");
+        dir.join("release-backend-fork.yml").exists() && !dir.join("ci.yml").exists()
+    }
+
     /// The set of integration target names, i.e. `backend/tests/*.rs` stems.
     fn integration_targets() -> BTreeSet<String> {
         let dir = repo_root().join("backend/tests");
@@ -225,6 +233,13 @@ mod tests {
     /// CI, not a silently dead test.
     #[test]
     fn every_integration_target_is_wired_into_ci_or_exempt() {
+        if fork_ci_layout() {
+            eprintln!(
+                "SKIP every_integration_target_is_wired_into_ci_or_exempt: \
+                 fork layout keeps only release-backend-fork.yml"
+            );
+            return;
+        }
         let targets = integration_targets();
         let mut wired_default = BTreeSet::new(); // runs the default (non-ignored) set
         let mut wired_ignored = BTreeSet::new(); // runs the `-- --ignored` set
@@ -343,6 +358,13 @@ mod tests {
     /// below still requires that leg's `--lib --bins` invocation to exist.
     #[test]
     fn nextest_lib_invocations_include_bins() {
+        if fork_ci_layout() {
+            eprintln!(
+                "SKIP nextest_lib_invocations_include_bins: \
+                 fork layout keeps only release-backend-fork.yml"
+            );
+            return;
+        }
         let ci = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml"))
             .expect("ci.yml readable");
         let mut with_bins = 0usize;
@@ -384,6 +406,13 @@ mod tests {
     /// before the invocation that runs them, which does carry the flag).
     #[test]
     fn nextest_explicit_target_invocations_fail_on_zero_tests() {
+        if fork_ci_layout() {
+            eprintln!(
+                "SKIP nextest_explicit_target_invocations_fail_on_zero_tests: \
+                 fork layout keeps only release-backend-fork.yml"
+            );
+            return;
+        }
         let ci = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml"))
             .expect("ci.yml readable");
         let violations: Vec<_> = logical_lines(&ci)

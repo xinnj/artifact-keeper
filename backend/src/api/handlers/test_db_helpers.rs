@@ -2094,15 +2094,16 @@ pub async fn subscribe_push_peer(pool: &PgPool, repo_id: Uuid, label: &str) -> U
 }
 
 /// #4725: the artifact paths in `repo_id` that have a queued `push` sync task
-/// for `peer_id`, ordered by path. A native-format hosted upload that forgot
-/// to queue replication yields an empty vector.
+/// for `peer_id`, ordered by path in byte order (`COLLATE "C"`), so the result
+/// does not depend on the database's locale. A native-format hosted upload
+/// that forgot to queue replication yields an empty vector.
 pub async fn queued_push_paths(pool: &PgPool, peer_id: Uuid, repo_id: Uuid) -> Vec<String> {
     sqlx::query_scalar(
         "SELECT a.path FROM sync_tasks st \
          JOIN artifacts a ON a.id = st.artifact_id \
          WHERE st.peer_instance_id = $1 AND st.task_type = 'push' \
            AND a.repository_id = $2 AND a.is_deleted = false \
-         ORDER BY a.path",
+         ORDER BY a.path COLLATE \"C\"",
     )
     .bind(peer_id)
     .bind(repo_id)
